@@ -1,105 +1,125 @@
-#[path = "./db_util.rs"]
-mod db_util;
-
-use core::cell::RefCell;
-
-use xitca_postgres::{Execute, iter::AsyncLendingIterator, pipeline::Pipeline, pool::Pool};
-
-use super::{
-    ser::{Fortune, Fortunes, World},
-    util::{DB_URL, HandleResult},
+use xitca_postgres::{
+    Execute,
+    dev::Query,
+    iter::AsyncLendingIterator,
+    statement::{Statement, StatementNamed},
+    types::Type,
 };
 
-use db_util::{FORTUNE_STMT, Shared, UPDATE_STMT, WORLD_STMT, not_found};
+use crate::{
+    ser::{Fortune, Fortunes, World},
+    util::{Error, HandleResult, Rand},
+};
 
-pub struct Client {
-    pool: Pool,
-    shared: RefCell<Shared>,
+#[cold]
+#[inline(never)]
+fn not_found() -> Error {
+    "request World does not exist".into()
 }
 
-pub async fn create() -> HandleResult<Client> {
-    Ok(Client {
-        pool: Pool::builder(DB_URL).capacity(1).build()?,
-        shared: Default::default(),
-    })
+#[derive(Default)]
+pub struct Exec {
+    rng: core::cell::RefCell<Rand>,
 }
 
-impl Client {
-    pub async fn get_world(&self) -> HandleResult<World> {
-        let mut conn = self.pool.get().await?;
-        let stmt = WORLD_STMT.execute(&mut conn).await?;
-        let id = self.shared.borrow_mut().0.gen_id();
-        let mut res = stmt.bind([id]).query(&conn.consume()).await?;
+impl Exec {
+    pub const FORTUNE_STMT: StatementNamed<'_> = Statement::named("SELECT id,message FROM fortune", &[]);
+    pub const WORLD_STMT: StatementNamed<'_> =
+        Statement::named("SELECT id,randomNumber FROM world WHERE id=$1", &[Type::INT4]);
+    pub const UPDATE_STMT: StatementNamed<'_> = Statement::named(
+        "UPDATE world SET randomNumber=w.r FROM (SELECT unnest($1) as i,unnest($2) as r) w WHERE world.id=w.i",
+        &[Type::INT4_ARRAY, Type::INT4_ARRAY],
+    );
+
+    pub(crate) async fn db<C>(&self, conn: C, stmt: &Statement) -> HandleResult<World>
+    where
+        C: Query,
+    {
+        let id = self.rng.borrow_mut().gen_id();
+        let mut res = stmt.bind([id]).query(&conn).await?;
+        drop(conn);
         let row = res.try_next().await?.ok_or_else(not_found)?;
         Ok(World::new(row.get(0), row.get(1)))
     }
 
-    pub async fn get_worlds(&self, num: u16) -> HandleResult<Vec<World>> {
-        let mut conn = self.pool.get().await?;
-        let stmt = WORLD_STMT.execute(&mut conn).await?;
+    pub(crate) async fn queries<C>(&self, conn: C, stmt: &Statement, num: u16) -> HandleResult<Vec<World>>
+    where
+        C: Query,
+    {
+        let get = self
+            .rng
+            .borrow_mut()
+            .gen_multi()
+            .take(num as _)
+            .map(|id| stmt.bind([id]).query(&conn))
+            .collect::<Vec<_>>();
 
-        let mut res = {
-            let (ref mut rng, ref mut buf) = *self.shared.borrow_mut();
-            let mut pipe = Pipeline::with_capacity_from_buf(num as _, buf);
-            rng.gen_multi()
-                .take(num as _)
-                .try_for_each(|id| stmt.bind([id]).query(&mut pipe))?;
-            pipe.query(&conn.consume())?
-        };
+        drop(conn);
 
         let mut worlds = Vec::with_capacity(num as _);
 
-        while let Some(mut item) = res.try_next().await? {
-            let row = item.try_next().await?.ok_or_else(not_found)?;
+        for get in get {
+            let mut res = get.await?;
+            let row = res.try_next().await?.ok_or_else(not_found)?;
             worlds.push(World::new(row.get(0), row.get(1)));
         }
 
         Ok(worlds)
     }
 
-    pub async fn update(&self, num: u16) -> HandleResult<Vec<World>> {
-        let mut conn = self.pool.get().await?;
-        let world_stmt = WORLD_STMT.execute(&mut conn).await?;
-        let update_stmt = UPDATE_STMT.execute(&mut conn).await?;
-
-        let (mut res, worlds) = {
-            let (ref mut rng, ref mut buf) = *self.shared.borrow_mut();
-            let mut pipe = Pipeline::with_capacity_from_buf((num + 1) as _, buf);
-
+    pub(crate) async fn updates<C>(
+        &self,
+        conn: C,
+        world_stmt: &Statement,
+        update_stmt: &Statement,
+        num: u16,
+    ) -> HandleResult<Vec<World>>
+    where
+        C: Query,
+    {
+        let (worlds, get, update) = {
+            let mut rng = self.rng.borrow_mut();
             let mut ids = rng.gen_multi().take(num as _).collect::<Vec<_>>();
             ids.sort();
 
-            let (rngs, worlds) = ids
+            let (get, rngs, worlds) = ids
                 .iter()
                 .cloned()
                 .zip(rng.gen_multi())
                 .map(|(id, rand)| {
-                    world_stmt.bind([id]).query(&mut pipe)?;
-                    HandleResult::Ok((rand, World::new(id, rand)))
+                    let get = world_stmt.bind([id]).query(&conn);
+                    (get, rand, World::new(id, rand))
                 })
-                .collect::<HandleResult<(Vec<_>, Vec<_>)>>()?;
-            update_stmt.bind([&ids, &rngs]).query(&mut pipe)?;
-            (pipe.query(&conn.consume())?, worlds)
+                .collect::<(Vec<_>, Vec<_>, Vec<_>)>();
+
+            let update = update_stmt.bind([&ids, &rngs]).execute(&conn);
+
+            drop(conn);
+
+            (worlds, get, update)
         };
 
-        while let Some(mut item) = res.try_next().await? {
-            while let Some(row) = item.try_next().await? {
-                let _rand = row.get::<i32>(1);
-            }
+        for get in get {
+            let _rand = get.await?.try_next().await?.ok_or_else(not_found)?.get::<i32>(1);
         }
+
+        update.await?;
 
         Ok(worlds)
     }
 
-    pub async fn tell_fortune(&self) -> HandleResult<Fortunes> {
+    pub(crate) async fn fortunes<C>(conn: C, stmt: &Statement) -> HandleResult<Fortunes>
+    where
+        C: Query,
+    {
+        let mut res = stmt.query(&conn).await?;
+
+        drop(conn);
+
         let mut fortunes = Vec::with_capacity(16);
 
-        let mut conn = self.pool.get().await?;
-        let stmt = FORTUNE_STMT.execute(&mut conn).await?;
-        let mut res = stmt.query(&conn.consume()).await?;
-
         while let Some(row) = res.try_next().await? {
-            fortunes.push(Fortune::new(row.get(0), row.get::<String>(1)));
+            fortunes.push(Fortune::new(row.get(0), row.get_zc(1)));
         }
 
         Ok(Fortunes::new(fortunes))
