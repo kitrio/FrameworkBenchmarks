@@ -44,7 +44,7 @@ ADDITIONAL_FORTUNE = Fortune(
     id=0, message="Additional fortune added at request time."
 )
 sort_fortunes_key = attrgetter("message")
-MAX_POOL_SIZE = 1000//(multiprocessing.cpu_count()*2)
+MAX_POOL_SIZE = 1000//multiprocessing.cpu_count()
 
 template_path = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "templates"
